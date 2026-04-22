@@ -56,8 +56,14 @@ export function GameProvider({ children }) {
 
     const onRoomJoined = (data) => {
       setRoomState(data.room)
-      setMyRole(data.role)
+      if (data.role) setMyRole(data.role)
+      // Server now sends the other player as `partner` on join
       if (data.partner) setPartner(data.partner)
+      // Also derive partner from the room snapshot if not explicitly provided
+      else if (data.room?.players && data.playerId) {
+        const other = data.room.players.find(p => p.id !== data.playerId)
+        if (other) setPartner(other)
+      }
     }
 
     const onGameState = (state) => {

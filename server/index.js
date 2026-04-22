@@ -363,12 +363,14 @@ io.on('connection', (socket) => {
 
       const snapshot = rooms.roomSnapshot(result.room);
 
-      const response = { roomCode, playerId, room: snapshot };
+      // Tell the joiner about the room AND who their partner (host) is
+      const host = result.room.players.find(p => p.id !== playerId);
+      const response = { roomCode, playerId, room: snapshot, role: 'guest', partner: host || null };
       if (typeof ack === 'function') ack({ ok: true, ...response });
       socket.emit('room:joined', response);
 
-      // Notify both players
-      io.to(roomCode).emit('room:partnerJoined', {
+      // Notify only the HOST that a partner joined (not the joiner themselves)
+      socket.to(roomCode).emit('room:partnerJoined', {
         room: snapshot,
         newPlayer: player,
       });
@@ -439,11 +441,15 @@ io.on('connection', (socket) => {
       const player = room.players.find(p => p.socketId === socket.id);
       if (player) player.ready = true;
 
-      // Allow solo-demo: treat a single player as "all ready" so the host
-      // can advance without a partner present.
-      const allReady =
-        room.players.every(p => p.ready) &&
-        (room.players.length >= 2 || (data && data.soloDemo));
+      const isHost = player && player.role === 'host';
+      const fromLobby = room.status === ROOM_STATUS.LOBBY;
+
+      // From the lobby: host clicking "Start Adventure" launches the game
+      // immediately — no need for the guest to also tap ready.
+      // Between games: both players must tap "Next Game" to advance.
+      const allReady = fromLobby
+        ? isHost  // host alone triggers start from lobby
+        : room.players.every(p => p.ready) && (room.players.length >= 2 || (data && data.soloDemo));
 
       io.to(room.roomCode).emit('room:readyState', {
         players: room.players.map(p => ({ id: p.id, ready: p.ready })),
@@ -457,7 +463,7 @@ io.on('connection', (socket) => {
         room.players.forEach(p => { p.ready = false; });
 
         if (room.mode === 'story') {
-          if (room.status === ROOM_STATUS.LOBBY) {
+          if (fromLobby) {
             // First start: kick off mini-game index 0
             const next = getNextMiniGame(room.roomCode, rooms);
             if (next) {
