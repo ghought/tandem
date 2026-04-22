@@ -53,6 +53,51 @@ function AppInner() {
     setScreen(s)
   }, [screen])
 
+  // ── Socket reconnect: restore session after phone sleep / network drop ──
+  useEffect(() => {
+    if (!socket) return
+
+    const onConnect = () => {
+      try {
+        const raw = localStorage.getItem('tandem_session')
+        if (!raw) return
+        const session = JSON.parse(raw)
+        if (!session?.roomCode || !session?.playerId) return
+
+        // Don't attempt if already in a room (fresh connect flow)
+        // Only reconnect if we're not on HOME screen and have room context
+        socket.emit('player:reconnect', {
+          playerId: session.playerId,
+          roomCode: session.roomCode,
+        }, (res) => {
+          if (res?.ok) {
+            setRoom(res.room)
+            setIsHost(session.isHost || false)
+            // Return to lobby if we were mid-game; let game:starting handle the rest
+            if (screen === SCREENS.HOME) goTo(SCREENS.LOBBY)
+          }
+          // If session expired that's fine — user will start fresh
+        })
+      } catch (_) {}
+    }
+
+    socket.on('connect', onConnect)
+
+    // Listen for partner reconnect events
+    const onPartnerReconnected = (data) => {
+      if (data?.player) {
+        // GameContext handles partner state via partner:joined / room:partnerJoined
+        // but we also emit this custom event — update partner here too
+      }
+    }
+    socket.on('room:partnerReconnected', onPartnerReconnected)
+
+    return () => {
+      socket.off('connect', onConnect)
+      socket.off('room:partnerReconnected', onPartnerReconnected)
+    }
+  }, [socket, screen]) // eslint-disable-line react-hooks/exhaustive-deps
+
   // ── Socket: game lifecycle ─────────────────────────────────────
   useEffect(() => {
     if (!socket) return
@@ -167,10 +212,18 @@ function AppInner() {
       if (response?.ok) {
         setRoom(response.room)
         setIsHost(false)
+        // Persist session so we can reconnect if socket drops
+        try {
+          localStorage.setItem('tandem_session', JSON.stringify({
+            roomCode: code.toUpperCase(),
+            playerId: player.id,
+            isHost: false,
+          }))
+        } catch (_) {}
         goTo(SCREENS.LOBBY, SCREENS.HOME)
         try { AudioManager.init().then(() => AudioManager.playConnect()) } catch (_) {}
       } else {
-        alert(response?.message || 'Could not join room. Check the code and try again.')
+        alert(response?.error || response?.message || 'Could not join room. Check the code and try again.')
       }
     })
   }
@@ -186,6 +239,14 @@ function AppInner() {
     socket.emit('room:create', { mode, player }, (response) => {
       if (response?.ok) {
         setRoom(response.room)
+        // Persist session for reconnect
+        try {
+          localStorage.setItem('tandem_session', JSON.stringify({
+            roomCode: response.room.roomCode,
+            playerId: player.id,
+            isHost: true,
+          }))
+        } catch (_) {}
         try { AudioManager.init() } catch (_) {}
       }
     })

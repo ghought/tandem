@@ -10,6 +10,16 @@ const rooms = new Map();
 /** @type {Map<string, string>} socketId → roomCode */
 const socketRoomIndex = new Map();
 
+/**
+ * Grace-period disconnect tracking.
+ * When a socket drops we don't immediately destroy the room — we give the
+ * player 45 seconds to reconnect (handles phone sleep, brief network loss).
+ * Key: playerId  →  { roomCode, timer }
+ */
+const disconnectTimers = new Map();
+
+const GRACE_PERIOD_MS = 45_000;
+
 // ─── Room code generation ─────────────────────────────────────────────────────
 
 const CONSONANTS = 'BCDFGHJKLMNPQRSTVWXYZ';
@@ -131,21 +141,121 @@ function joinRoom(roomCode, player) {
 }
 
 /**
- * Remove a player from their room by socket id.
+ * Called when a socket disconnects.  Instead of immediately removing the
+ * player we mark them as disconnected and start a grace-period timer.
+ * If they reconnect within GRACE_PERIOD_MS we restore them seamlessly.
  *
  * @param {string} roomCode
  * @param {string} socketId
- * @returns {object|null} the updated room, or null if the room was destroyed
+ * @param {Function} onExpired  called with (roomCode, playerId) if timer fires
+ * @returns {{ room: object, playerId: string|null }}
+ */
+function playerDisconnected(roomCode, socketId, onExpired) {
+  const room = rooms.get(roomCode);
+  if (!room) return { room: null, playerId: null };
+
+  const player = room.players.find(p => p.socketId === socketId);
+  if (!player) return { room, playerId: null };
+
+  const playerId = player.id;
+
+  // Mark the player as disconnected (keep them in room.players)
+  player.connected = false;
+  player.socketId  = null;
+  socketRoomIndex.delete(socketId);
+
+  // Cancel any previous timer for this player
+  const prev = disconnectTimers.get(playerId);
+  if (prev) clearTimeout(prev.timer);
+
+  // Start grace-period timer
+  const timer = setTimeout(() => {
+    disconnectTimers.delete(playerId);
+    _forceLeave(roomCode, playerId);
+    if (typeof onExpired === 'function') onExpired(roomCode, playerId);
+  }, GRACE_PERIOD_MS);
+
+  disconnectTimers.set(playerId, { roomCode, timer });
+
+  console.log(`[rooms] Socket ${socketId} disconnected from ${roomCode} — grace period started (player ${playerId})`);
+  return { room, playerId };
+}
+
+/**
+ * Internal: hard-remove a player after grace period expires.
+ */
+function _forceLeave(roomCode, playerId) {
+  const room = rooms.get(roomCode);
+  if (!room) return null;
+
+  room.players = room.players.filter(p => p.id !== playerId);
+
+  if (room.players.length === 0) {
+    if (room.gameEngine && typeof room.gameEngine.stop === 'function') {
+      room.gameEngine.stop();
+    }
+    rooms.delete(roomCode);
+    console.log(`[rooms] Room ${roomCode} destroyed (empty after grace period)`);
+    return null;
+  }
+
+  if (!room.players.find(p => p.role === 'host')) {
+    room.players[0].role = 'host';
+  }
+
+  console.log(`[rooms] Player ${playerId} removed from ${roomCode} (grace period expired)`);
+  return room;
+}
+
+/**
+ * Called when a previously-disconnected player reconnects.
+ * Cancels their grace-period timer and updates their socket id.
+ *
+ * @param {string} playerId
+ * @param {string} newSocketId
+ * @returns {{ room: object, player: object }|null}
+ */
+function playerReconnected(playerId, newSocketId) {
+  const entry = disconnectTimers.get(playerId);
+  if (!entry) return null;   // not in grace period — treat as fresh join
+
+  clearTimeout(entry.timer);
+  disconnectTimers.delete(playerId);
+
+  const room = rooms.get(entry.roomCode);
+  if (!room) return null;
+
+  const player = room.players.find(p => p.id === playerId);
+  if (!player) return null;
+
+  player.socketId  = newSocketId;
+  player.connected = true;
+  socketRoomIndex.set(newSocketId, entry.roomCode);
+
+  console.log(`[rooms] Player ${playerId} reconnected to ${entry.roomCode}`);
+  return { room, player };
+}
+
+/**
+ * Legacy hard-leave (used for intentional quits).
  */
 function leaveRoom(roomCode, socketId) {
   const room = rooms.get(roomCode);
   if (!room) return null;
 
+  const player = room.players.find(p => p.socketId === socketId);
+  const playerId = player ? player.id : null;
+
+  // Cancel any pending grace timer
+  if (playerId) {
+    const entry = disconnectTimers.get(playerId);
+    if (entry) { clearTimeout(entry.timer); disconnectTimers.delete(playerId); }
+  }
+
   room.players = room.players.filter(p => p.socketId !== socketId);
   socketRoomIndex.delete(socketId);
 
   if (room.players.length === 0) {
-    // Stop any running engine
     if (room.gameEngine && typeof room.gameEngine.stop === 'function') {
       room.gameEngine.stop();
     }
@@ -154,7 +264,6 @@ function leaveRoom(roomCode, socketId) {
     return null;
   }
 
-  // If the host left, promote the next player
   if (!room.players.find(p => p.role === 'host')) {
     room.players[0].role = 'host';
   }
@@ -219,6 +328,8 @@ module.exports = {
   createRoom,
   joinRoom,
   leaveRoom,
+  playerDisconnected,
+  playerReconnected,
   getRoom,
   getRoomBySocketId,
   updateRoomState,

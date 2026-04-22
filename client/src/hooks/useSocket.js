@@ -17,9 +17,10 @@ export function useSocket() {
       autoConnect: true,
       reconnection: true,
       reconnectionAttempts: Infinity,
-      reconnectionDelay: 1000,
-      reconnectionDelayMax: 5000,
-      timeout: 10000,
+      reconnectionDelay: 500,       // start retrying quickly
+      reconnectionDelayMax: 4000,   // cap at 4s (well inside the 45s grace window)
+      randomizationFactor: 0.3,
+      timeout: 20000,               // phones on mobile networks can be slow
     })
   }
 

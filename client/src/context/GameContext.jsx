@@ -79,8 +79,15 @@ export function GameProvider({ children }) {
     socket.on('room:joined', onRoomJoined)
     socket.on('partner:joined', onPartnerJoined)
     socket.on('room:partnerJoined', (data) => onPartnerJoined({ partner: data.newPlayer }))
+    socket.on('room:partnerReconnected', (data) => {
+      if (data?.player) onPartnerJoined({ partner: data.player })
+    })
     socket.on('partner:left', onPartnerLeft)
     socket.on('room:partnerLeft', onPartnerLeft)
+    socket.on('room:partnerDisconnected', () => {
+      // Partner temporarily disconnected — don't clear partner state yet,
+      // they may reconnect within the grace window
+    })
     socket.on('partner:updated', onPartnerUpdated)
     socket.on('game:state', onGameState)
     socket.on('narrator:text', onNarratorText)
@@ -91,6 +98,8 @@ export function GameProvider({ children }) {
       socket.off('room:joined', onRoomJoined)
       socket.off('partner:joined', onPartnerJoined)
       socket.off('room:partnerJoined')
+      socket.off('room:partnerReconnected')
+      socket.off('room:partnerDisconnected')
       socket.off('partner:left', onPartnerLeft)
       socket.off('room:partnerLeft', onPartnerLeft)
       socket.off('partner:updated', onPartnerUpdated)

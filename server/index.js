@@ -588,6 +588,51 @@ io.on('connection', (socket) => {
   socket.on('story:chapterStart',  handleStoryChapterStart);
   socket.on('story:startChapter',  handleStoryChapterStart);
 
+  // ── player:reconnect ─────────────────────────────────────────────────────
+  // Client fires this on every socket (re)connect if it has stored session data.
+
+  socket.on('player:reconnect', (data, ack) => {
+    try {
+      const { playerId, roomCode } = data || {};
+      if (!playerId || !roomCode) {
+        if (typeof ack === 'function') ack({ ok: false, error: 'Missing playerId or roomCode' });
+        return;
+      }
+
+      const result = rooms.playerReconnected(playerId, socket.id);
+
+      if (!result) {
+        // Grace period expired or room gone — treat as a fresh join attempt
+        if (typeof ack === 'function') ack({ ok: false, error: 'Session expired' });
+        return;
+      }
+
+      const { room, player } = result;
+      socket.join(room.roomCode);
+
+      const snapshot = rooms.roomSnapshot(room);
+      if (typeof ack === 'function') ack({ ok: true, room: snapshot, role: player.role });
+      socket.emit('room:joined', { roomCode: room.roomCode, playerId, room: snapshot });
+
+      // Tell partner they're back
+      socket.to(room.roomCode).emit('room:partnerReconnected', {
+        player: { id: player.id, name: player.name, palette: player.palette, accessory: player.accessory },
+        room: snapshot,
+      });
+
+      // Resume any paused engine
+      if (room.gameEngine && !room.gameEngine.isRunning) {
+        room.gameEngine.start();
+        io.to(room.roomCode).emit('game:resumed', { reason: 'partner_reconnected' });
+      }
+
+      console.log(`[socket] player:reconnect → ${room.roomCode} (player ${playerId})`);
+    } catch (err) {
+      console.error('[socket] player:reconnect error:', err);
+      if (typeof ack === 'function') ack({ ok: false, error: err.message });
+    }
+  });
+
   // ── disconnect ───────────────────────────────────────────────────────────
 
   socket.on('disconnect', (reason) => {
@@ -597,25 +642,30 @@ io.on('connection', (socket) => {
     if (!room) return;
 
     const { roomCode } = room;
-    const leavingPlayer = room.players.find(p => p.socketId === socket.id);
 
-    const updatedRoom = rooms.leaveRoom(roomCode, socket.id);
+    // Start grace period — don't destroy the room immediately
+    const { playerId } = rooms.playerDisconnected(roomCode, socket.id, (code, pid) => {
+      // Grace period expired: hard-remove the player
+      const updatedRoom = rooms.getRoom(code);
+      if (updatedRoom) {
+        io.to(code).emit('room:partnerLeft', {
+          playerId: pid,
+          permanent: true,
+          room: rooms.roomSnapshot(updatedRoom),
+        });
+      }
+      console.log(`[rooms] Player ${pid} permanently removed from ${code} (grace expired)`);
+    });
 
-    if (!updatedRoom) {
-      // Room was destroyed
-      return;
-    }
-
-    // Notify remaining partner
-    io.to(roomCode).emit('room:partnerLeft', {
-      playerId:   leavingPlayer ? leavingPlayer.id : null,
-      playerName: leavingPlayer ? leavingPlayer.name : 'Unknown',
-      room:       rooms.roomSnapshot(updatedRoom),
+    // Notify partner of temporary disconnect
+    io.to(roomCode).emit('room:partnerDisconnected', {
+      playerId,
+      reconnectWindowMs: 45000,
     });
 
     // Pause any running engine
-    if (updatedRoom.gameEngine && updatedRoom.gameEngine.isRunning) {
-      updatedRoom.gameEngine.stop();
+    if (room.gameEngine && room.gameEngine.isRunning) {
+      room.gameEngine.stop();
       io.to(roomCode).emit('game:paused', { reason: 'partner_disconnected' });
     }
   });
