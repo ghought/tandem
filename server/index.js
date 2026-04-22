@@ -14,6 +14,7 @@ const rooms       = require('./rooms');
 const { getNarratorLine }   = require('./narrator');
 const { getNextMiniGame, checkChapterComplete } = require('./progression');
 const { GAME_IDS, ROOM_STATUS, CHAPTERS } = require('../shared/constants');
+const { BotPlayer } = require('./bot');
 
 // ─── Game engine registry ─────────────────────────────────────────────────────
 
@@ -155,6 +156,24 @@ function createEngine(gameId, roomCode, config, room) {
   return new EngineClass(roomCode, { ...config, gameId }, io, room);
 }
 
+/** Add a virtual bot player to a room (idempotent). Returns the bot player object. */
+function addBotToRoom(room) {
+  const existing = room.players.find(p => p.isBot);
+  if (existing) return existing;
+  const botId = `bot_${room.roomCode}`;
+  const bot = {
+    id:        botId,
+    name:      'Tandem Bot',
+    socketId:  null,
+    palette:   'green',
+    accessory: 'none',
+    isBot:     true,
+    ready:     true,
+  };
+  room.players.push(bot);
+  return bot;
+}
+
 /** Start a mini-game in the room, handling narrator + engine lifecycle. */
 function startMiniGame(roomCode, gameId, config = {}) {
   const room = rooms.getRoom(roomCode);
@@ -165,6 +184,12 @@ function startMiniGame(roomCode, gameId, config = {}) {
     room.gameEngine.stop();
   }
 
+  // Stop any running bot
+  if (room.botPlayer) {
+    room.botPlayer.stop();
+    room.botPlayer = null;
+  }
+
   const engine = createEngine(gameId, roomCode, config, room);
 
   rooms.updateRoomState(roomCode, {
@@ -172,12 +197,18 @@ function startMiniGame(roomCode, gameId, config = {}) {
     status:          ROOM_STATUS.PLAYING,
     gameEngine:      engine,
     gameState:       {},
+    botPlayer:       null,
   });
 
-  // Assign roles: first player = player1, second = player2
+  // Assign roles: human players first (player1, player2), bot always player2
   const updatedRoom = rooms.getRoom(roomCode);
-  for (let i = 0; i < updatedRoom.players.length; i++) {
-    updatedRoom.players[i].role = i === 0 ? 'player1' : 'player2';
+  const humanPlayers = updatedRoom.players.filter(p => !p.isBot);
+  const botPlayers   = updatedRoom.players.filter(p => p.isBot);
+  for (let i = 0; i < humanPlayers.length; i++) {
+    humanPlayers[i].role = i === 0 ? 'player1' : 'player2';
+  }
+  for (const bot of botPlayers) {
+    bot.role = 'player2';
   }
 
   io.to(roomCode).emit('game:starting', {
@@ -190,14 +221,33 @@ function startMiniGame(roomCode, gameId, config = {}) {
       role:      p.role,
       palette:   p.palette,
       accessory: p.accessory,
+      isBot:     p.isBot || false,
     })),
     config,
   });
 
+  // Emit role:assigned individually so each client knows their own role
+  for (const p of updatedRoom.players) {
+    if (p.socketId && !p.isBot) {
+      io.to(p.socketId).emit('role:assigned', { role: p.role });
+    }
+  }
+
   if (engine) {
     // Small delay to let clients prepare
     setTimeout(() => {
-      if (rooms.getRoom(roomCode)) engine.start();
+      const r = rooms.getRoom(roomCode);
+      if (!r) return;
+      engine.start();
+
+      // Start bot automation if the room has a bot player
+      const botP = r.players.find(p => p.isBot);
+      if (botP) {
+        const bot = new BotPlayer(engine, botP.id, gameId);
+        bot.start();
+        rooms.updateRoomState(roomCode, { botPlayer: bot });
+        console.log(`[bot] Started bot for ${roomCode} / ${gameId}`);
+      }
     }, 1000);
   }
 }
@@ -441,15 +491,25 @@ io.on('connection', (socket) => {
       const player = room.players.find(p => p.socketId === socket.id);
       if (player) player.ready = true;
 
-      const isHost = player && player.role === 'host';
+      const isHost = player && (player.role === 'host' || player.role === 'player1' ||
+                                room.players.indexOf(player) === 0);
       const fromLobby = room.status === ROOM_STATUS.LOBBY;
+      const isSolo    = !!(data && data.soloDemo);
 
-      // From the lobby: host clicking "Start Adventure" launches the game
-      // immediately — no need for the guest to also tap ready.
-      // Between games: both players must tap "Next Game" to advance.
+      // Solo Play Mode: add a bot player if not already present
+      if (isSolo) {
+        addBotToRoom(room);
+        // Mark bot as ready too
+        const botP = room.players.find(p => p.isBot);
+        if (botP) botP.ready = true;
+      }
+
+      // From lobby: host (or solo) starts the game immediately.
+      // Between games: all human players must be ready.
+      const humanPlayers = room.players.filter(p => !p.isBot);
       const allReady = fromLobby
-        ? isHost  // host alone triggers start from lobby
-        : room.players.every(p => p.ready) && (room.players.length >= 2 || (data && data.soloDemo));
+        ? (isHost || isSolo)
+        : humanPlayers.every(p => p.ready) && (humanPlayers.length >= 1 || isSolo);
 
       io.to(room.roomCode).emit('room:readyState', {
         players: room.players.map(p => ({ id: p.id, ready: p.ready })),
@@ -459,8 +519,8 @@ io.on('connection', (socket) => {
       if (typeof ack === 'function') ack({ ok: true, allReady });
 
       if (allReady) {
-        // Reset ready flags for next round
-        room.players.forEach(p => { p.ready = false; });
+        // Reset ready flags for human players only
+        room.players.forEach(p => { if (!p.isBot) p.ready = false; });
 
         if (room.mode === 'story') {
           if (fromLobby) {
@@ -477,6 +537,7 @@ io.on('connection', (socket) => {
             advanceStoryMode(room.roomCode);
           }
         } else if (data && data.gameId) {
+          // Play mode: start the requested game (solo + bot or multiplayer)
           startMiniGame(room.roomCode, data.gameId, data.config || {});
         }
       }

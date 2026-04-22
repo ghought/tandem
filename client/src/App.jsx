@@ -166,6 +166,7 @@ function AppInner() {
     socket.on('game:starting',        onGameStarting)
     socket.on('game:start',           onGameStart)
     socket.on('game:results',         onGameResults)
+    socket.on('game:result',          onGameResults)  // engine emits singular
     socket.on('chapter:progress',     onChapterProgress)
     socket.on('chapter:start',        onChapterStart)
     socket.on('chapter:complete',     onChapterComplete)
@@ -175,6 +176,7 @@ function AppInner() {
       socket.off('game:starting',        onGameStarting)
       socket.off('game:start',           onGameStart)
       socket.off('game:results',         onGameResults)
+      socket.off('game:result',          onGameResults)
       socket.off('chapter:progress',     onChapterProgress)
       socket.off('chapter:start',        onChapterStart)
       socket.off('chapter:complete',     onChapterComplete)
@@ -275,8 +277,13 @@ function AppInner() {
   const handleNextGame = useCallback(() => {
     clearGameResults()
     if (socket && room) {
-      socket.emit('game:ready', { roomCode: room.roomCode })
-      // Stay on results/loading — server will push game:starting when both ready
+      if (room.mode === 'play') {
+        // Play Mode is solo — go back to game select menu after each game
+        goTo(SCREENS.PLAY_MODE)
+      } else {
+        socket.emit('game:ready', { roomCode: room.roomCode })
+        // Stay on results/loading — server will push game:starting when both ready
+      }
     } else {
       goTo(SCREENS.CHAPTER_MAP)
     }
@@ -300,6 +307,33 @@ function AppInner() {
   const handleSelectGame = (game) => {
     setActiveGame({ id: game.id, title: game.title, hint: game.description })
     goTo(SCREENS.MINI_GAME)
+
+    if (!socket) return
+
+    const startSoloGame = (roomCode) => {
+      socket.emit('game:ready', { roomCode, soloDemo: true, gameId: game.id })
+    }
+
+    if (room?.roomCode) {
+      // Already in a room (e.g. re-selecting after a game) — reuse it
+      startSoloGame(room.roomCode)
+    } else {
+      // Create a play-mode room first, then launch
+      socket.emit('room:create', { mode: 'play', player }, (response) => {
+        if (response?.ok) {
+          setRoom(response.room)
+          setIsHost(true)
+          try {
+            localStorage.setItem('tandem_session', JSON.stringify({
+              roomCode: response.room.roomCode,
+              playerId: player.id,
+              isHost: true,
+            }))
+          } catch (_) {}
+          startSoloGame(response.room.roomCode)
+        }
+      })
+    }
   }
 
   const handleGameComplete = (action) => {

@@ -98,6 +98,7 @@ export function GameProvider({ children }) {
     socket.on('game:state', onGameState)
     socket.on('narrator:text', onNarratorText)
     socket.on('game:results', onGameResults)
+    socket.on('game:result',  onGameResults)  // engine emits singular form
     socket.on('role:assigned', onRoleAssigned)
 
     return () => {
@@ -112,6 +113,7 @@ export function GameProvider({ children }) {
       socket.off('game:state', onGameState)
       socket.off('narrator:text', onNarratorText)
       socket.off('game:results', onGameResults)
+      socket.off('game:result',  onGameResults)
       socket.off('role:assigned', onRoleAssigned)
     }
   }, [socket])

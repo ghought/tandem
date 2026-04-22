@@ -27,11 +27,12 @@ function generateDemoNotes(laneCount, now) {
   return notes
 }
 
-const LANE_COUNT    = 3
-const NOTE_HEIGHT   = 36
-const NOTE_SPEED    = 2.2   // px per frame (at 60fps)
-const HIT_ZONE_Y    = 0.82  // fraction from top where target line is
-const HIT_WINDOW    = 60    // pixels from target center = success
+const LANE_COUNT         = 3
+const NOTE_HEIGHT        = 36
+const NOTE_SPEED         = 2.2    // px per frame (at 60fps)
+const NOTE_SPEED_PX_MS   = NOTE_SPEED * 60 / 1000  // px per ms
+const HIT_ZONE_Y         = 0.82   // fraction from top where target line is
+const HIT_WINDOW         = 60     // pixels from target center = success
 
 function LaneButton({ laneIdx, color, label, onTap }) {
   const [pressed, setPressed] = useState(false)
@@ -65,7 +66,7 @@ function LaneButton({ laneIdx, color, label, onTap }) {
 }
 
 export default function HarmonyGame() {
-  const { player, partner, myRole } = useGame()
+  const { player, partner, myRole, socket } = useGame()
   const { gameState, sendInput } = useGameState()
 
   const [notes, setNotes]         = useState(() => generateDemoNotes(LANE_COUNT, Date.now()))
@@ -74,46 +75,84 @@ export default function HarmonyGame() {
   const [hitFeedback, setHitFeedback] = useState([]) // {id, x, y, type}
   const [floatingNotes, setFloatingNotes] = useState([]) // decorative ♩ symbols
 
-  const containerRef = useRef(null)
-  const animRef      = useRef(null)
-  const notesRef     = useRef(notes)
-  const frameRef     = useRef(0)
+  const containerRef    = useRef(null)
+  const animRef         = useRef(null)
+  const gameStateRef    = useRef(null)   // always holds latest gameState without triggering re-render
+  const frameRef        = useRef(0)
 
-  notesRef.current = notes
-
-  // Sync state from server
+  // Keep gameStateRef in sync (no re-render side-effects)
   useEffect(() => {
-    if (!gameState) return
-    if (gameState.notes)        setNotes(gameState.notes)
-    if (gameState.partnerNotes) setPartnerNotes(gameState.partnerNotes)
-    if (gameState.harmony !== undefined) setHarmonyLevel(gameState.harmony)
+    gameStateRef.current = gameState
   }, [gameState])
 
-  // Scroll notes down each frame
+  // ── Sync notes from server state ─────────────────────────────────────────
+  // Runs whenever gameState updates; merges server note list into local state
+  // while preserving the animated y-position for notes already on screen.
+  useEffect(() => {
+    if (!gameState) return
+
+    if (gameState.notes) {
+      const h        = containerRef.current?.clientHeight || 600
+      const hitZoneY = h * HIT_ZONE_Y
+      const songTime = gameState.songTime || 0
+
+      setNotes(prev => {
+        const prevMap = new Map(prev.map(n => [n.id, n]))
+        const next = gameState.notes.map(sn => {
+          const id      = sn.noteId || sn.id
+          const existing = prevMap.get(id)
+          if (existing) {
+            // Keep animated y; just update server-authoritative flags
+            return { ...existing, hit: sn.hit, missed: sn.missed }
+          }
+          // New note arriving from server: calculate starting y from timing
+          const dt = sn.time - songTime  // ms until note hits the target line
+          const y  = hitZoneY - dt * NOTE_SPEED_PX_MS
+          return {
+            id,
+            lane:   sn.lane,
+            y,
+            note:   sn.note || NOTES_SCALE[sn.lane % NOTES_SCALE.length],
+            hit:    sn.hit    || false,
+            missed: sn.missed || false,
+          }
+        })
+        return next
+      })
+    }
+
+    if (gameState.harmonyMeter !== undefined) {
+      setHarmonyLevel(gameState.harmonyMeter / 100)
+    }
+  }, [gameState])
+
+  // ── Animation loop — runs once, never restarts ────────────────────────────
   useEffect(() => {
     const frame = () => {
       frameRef.current++
-      const h = containerRef.current?.clientHeight || 600
+      const h       = containerRef.current?.clientHeight || 600
       const targetY = h * HIT_ZONE_Y
 
-      setNotes(prev =>
-        prev.map(n => ({
-          ...n,
-          y: n.y + NOTE_SPEED,
-          missed: !n.hit && !n.missed && n.y > targetY + NOTE_HEIGHT * 2,
-        })).filter(n => n.y < h + NOTE_HEIGHT * 2)
-      )
-
-      // Respawn notes if running low (demo mode)
       setNotes(prev => {
-        if (prev.length < 6 && !gameState?.notes) {
+        const moved = prev.map(n => ({
+          ...n,
+          y:      n.y + NOTE_SPEED,
+          missed: !n.hit && !n.missed && n.y > targetY + NOTE_HEIGHT * 2,
+        }))
+        // Only filter out notes that have scrolled way past the bottom
+        return moved.filter(n => n.y < h + NOTE_HEIGHT * 2)
+      })
+
+      // Demo-mode respawn — only when there's no live server state
+      setNotes(prev => {
+        if (prev.length < 6 && !gameStateRef.current?.notes) {
           const topNote = prev.reduce((min, n) => n.y < min ? n.y : min, 0)
           const newNote = {
-            id: `n-${Date.now()}-${Math.random()}`,
-            lane: Math.floor(Math.random() * LANE_COUNT),
-            y: Math.min(topNote - 120, -80),
-            note: NOTES_SCALE[Math.floor(Math.random() * NOTES_SCALE.length)],
-            hit: false,
+            id:     `n-${Date.now()}-${Math.random()}`,
+            lane:   Math.floor(Math.random() * LANE_COUNT),
+            y:      Math.min(topNote - 120, -80),
+            note:   NOTES_SCALE[Math.floor(Math.random() * NOTES_SCALE.length)],
+            hit:    false,
             missed: false,
           }
           return [...prev, newNote]
@@ -121,10 +160,7 @@ export default function HarmonyGame() {
         return prev
       })
 
-      // Decay harmony
       setHarmonyLevel(prev => Math.max(0, prev - 0.001))
-
-      // Clear old feedback
       setHitFeedback(prev => prev.filter(f => Date.now() - f.ts < 600))
       setFloatingNotes(prev =>
         prev
@@ -136,7 +172,26 @@ export default function HarmonyGame() {
     }
     animRef.current = requestAnimationFrame(frame)
     return () => cancelAnimationFrame(animRef.current)
-  }, [gameState])
+  }, [])  // ← empty deps: loop starts once and never restarts
+
+  // ── React to server note events (hit/miss broadcast) ─────────────────────
+  useEffect(() => {
+    if (!socket) return
+    const onNoteHit = ({ noteId, harmony }) => {
+      setNotes(prev => prev.map(n => n.id === noteId ? { ...n, hit: true } : n))
+      if (harmony !== undefined) setHarmonyLevel(harmony / 100)
+    }
+    const onNoteMiss = ({ noteId, harmony }) => {
+      setNotes(prev => prev.map(n => n.id === noteId ? { ...n, missed: true } : n))
+      if (harmony !== undefined) setHarmonyLevel(harmony / 100)
+    }
+    socket.on('game:noteHit',  onNoteHit)
+    socket.on('game:noteMiss', onNoteMiss)
+    return () => {
+      socket.off('game:noteHit',  onNoteHit)
+      socket.off('game:noteMiss', onNoteMiss)
+    }
+  }, [socket])
 
   const handleLaneTap = useCallback(async (laneIdx) => {
     const h = containerRef.current?.clientHeight || 600

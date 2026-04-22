@@ -57,6 +57,8 @@ class ButterflyChaseEngine extends BaseGameEngine {
     this.caught     = { 1: 0, 2: 0 };
     this.scareZones = [];   // { x, y, owner, ts } — short-lived scare events
     this.finished   = false;
+    this.startedAt  = null;
+    this.TIME_LIMIT = 90_000; // 90 s
   }
 
   // ─── Helpers ───────────────────────────────────────────────────────────────
@@ -73,6 +75,11 @@ class ButterflyChaseEngine extends BaseGameEngine {
     if (this.finished) return;
 
     const now = Date.now();
+    if (!this.startedAt) this.startedAt = now;
+    if (now - this.startedAt >= this.TIME_LIMIT) {
+      this._endGame(false);
+      return;
+    }
     // Remove expired scare zones (older than 500ms)
     this.scareZones = this.scareZones.filter(z => now - z.ts < 500);
 
